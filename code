@@ -1,0 +1,154 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import win32gui
+import time
+import math
+
+pyautogui.FAILSAFE = False  # отключаем аварийную остановку в углу экрана
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Не удалось открыть камеру!")
+    exit()
+
+SCREEN_W, SCREEN_H = pyautogui.size()
+
+# --- настройки ---
+CURSOR_SMOOTHING = 0.3      # плавность движения курсора
+PINCH_THRESHOLD = 0.05      # расстояние большой-указательный для клика
+CLICK_COOLDOWN = 0.6        # секунд между кликами
+SWIPE_THRESHOLD = 0.35      # скорость движения руки для свайпа (нормализ. координаты/сек)
+SWIPE_COOLDOWN = 1.0        # секунд между свайпами
+
+smooth_x, smooth_y = SCREEN_W // 2, SCREEN_H // 2
+last_click_time = 0
+
+# для свайпа
+prev_wrist_x = None
+prev_time = time.time()
+last_swipe_time = 0
+
+# для перетаскивания окна кулаком
+dragging = False
+drag_window = None
+drag_start_hand = None
+drag_start_win = None
+
+
+def is_hand_open(landmarks):
+    tips = [8, 12, 16, 20]
+    pips = [6, 10, 14, 18]
+    extended = 0
+    for tip, pip in zip(tips, pips):
+        if landmarks[tip].y < landmarks[pip].y:
+            extended += 1
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+    if abs(thumb_tip.x - thumb_ip.x) > 0.04:
+        extended += 1
+    return extended >= 4
+
+
+def distance(p1, p2):
+    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+
+    status_text = "Рука не найдена"
+    now = time.time()
+
+    if results.multi_hand_landmarks:
+        hand_landmarks = results.multi_hand_landmarks[0]
+        landmarks = hand_landmarks.landmark
+        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+        index_tip = landmarks[8]
+        thumb_tip = landmarks[4]
+        wrist = landmarks[0]
+
+        hand_open = is_hand_open(landmarks)
+
+        # --- 1. Управление курсором (по указательному пальцу) ---
+        target_x = index_tip.x * SCREEN_W
+        target_y = index_tip.y * SCREEN_H
+        smooth_x += (target_x - smooth_x) * CURSOR_SMOOTHING
+        smooth_y += (target_y - smooth_y) * CURSOR_SMOOTHING
+
+        # --- 2. Клик через щипок ---
+        pinch_dist = distance(index_tip, thumb_tip)
+        if pinch_dist < PINCH_THRESHOLD and (now - last_click_time) > CLICK_COOLDOWN:
+            pyautogui.click()
+            last_click_time = now
+            status_text = "Клик!"
+
+        # --- 3. Перетаскивание окна кулаком ---
+        if not hand_open:
+            if not dragging:
+                dragging = True
+                drag_window = win32gui.GetForegroundWindow()
+                drag_start_hand = (wrist.x, wrist.y)
+                rect = win32gui.GetWindowRect(drag_window)
+                drag_start_win = (rect[0], rect[1])
+            else:
+                dx = (wrist.x - drag_start_hand[0]) * SCREEN_W
+                dy = (wrist.y - drag_start_hand[1]) * SCREEN_H
+                new_x = int(drag_start_win[0] + dx)
+                new_y = int(drag_start_win[1] + dy)
+                rect = win32gui.GetWindowRect(drag_window)
+                w = rect[2] - rect[0]
+                h = rect[3] - rect[1]
+                win32gui.MoveWindow(drag_window, new_x, new_y, w, h, True)
+            status_text = "Перетаскивание окна"
+        else:
+            dragging = False
+
+            # двигаем курсор только когда рука открыта (не в кулаке)
+            pyautogui.moveTo(smooth_x, smooth_y)
+            if status_text == "Рука не найдена":
+                status_text = "Курсор активен"
+
+        # --- 4. Свайп для медиа (быстрое горизонтальное движение открытой ладони) ---
+        if hand_open and prev_wrist_x is not None:
+            dt = now - prev_time
+            if dt > 0:
+                velocity = (wrist.x - prev_wrist_x) / dt
+                if abs(velocity) > SWIPE_THRESHOLD and (now - last_swipe_time) > SWIPE_COOLDOWN:
+                    if velocity > 0:
+                        pyautogui.press('nexttrack')
+                        status_text = "Свайп -> Следующий трек"
+                    else:
+                        pyautogui.press('prevtrack')
+                        status_text = "Свайп -> Предыдущий трек"
+                    last_swipe_time = now
+
+        prev_wrist_x = wrist.x
+        prev_time = now
+
+    cv2.putText(frame, status_text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    cv2.imshow("Hand Control", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
